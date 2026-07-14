@@ -8,31 +8,43 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || '127.0.0.1';
+
+// Create HTTP client
+const client = axios.create({
+    timeout: 30000,
+    maxRedirects: 5
+});
 
 // Middleware
-app.use(helmet());
-app.use(cors());
+app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false
+}));
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: '*',
+    maxAge: 3600
+}));
 app.use(morgan('combined'));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Rate limiting
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
+    windowMs: 15 * 60 * 1000,
     max: 100,
     message: { error: true, message: 'Too many requests, please try again later.' }
 });
 app.use('/api/', limiter);
 
-// ==================== Facebook Downloader Class ====================
+// ==================== Facebook Downloader ====================
 class FacebookDownloader {
-    constructor(url) {
-        this.url = url;
-        this.client = axios.create({
-            timeout: 30000,
-            maxRedirects: 5
-        });
+    constructor(client, url) {
+        this.url = url.replace('web.facebook', 'www.facebook');
+        this.client = client;
     }
 
     static getHeaders() {
@@ -61,24 +73,21 @@ class FacebookDownloader {
 
     async get(url) {
         return await this.client.get(url, {
-            headers: FacebookDownloader.getHeaders()
+            headers: FacebookDownloader.getHeaders(),
+            maxRedirects: 5
         });
     }
 
     static getNestedValue(data, key) {
         if (typeof data !== 'object' || data === null) return null;
-
-        if (data.hasOwnProperty(key)) {
-            return data[key];
-        }
-
+        if (data.hasOwnProperty(key)) return data[key];
+        
         for (const value of Object.values(data)) {
             if (typeof value === 'object') {
                 const result = FacebookDownloader.getNestedValue(value, key);
                 if (result !== null) return result;
             }
         }
-
         return null;
     }
 
@@ -109,7 +118,6 @@ class FacebookDownloader {
         ];
 
         const urls = new Set();
-
         for (const field of fields) {
             const pattern = new RegExp(`"${field}"\\s*:\\s*"([^"]+)"`, 'g');
             let match;
@@ -119,13 +127,9 @@ class FacebookDownloader {
                 const looksLikeMedia = url.startsWith('http') &&
                     (lower.includes('.mp4') || lower.includes('video') || 
                      lower.includes('fbcdn') || lower.includes('fbsbx'));
-
-                if (looksLikeMedia) {
-                    urls.add(url);
-                }
+                if (looksLikeMedia) urls.add(url);
             }
         }
-
         return Array.from(urls);
     }
 
@@ -138,9 +142,7 @@ class FacebookDownloader {
             'hd_src',
             'sd_src'
         ];
-
         const urls = new Set();
-
         for (const field of fields) {
             const value = FacebookDownloader.getNestedValue(data, field);
             if (value && typeof value === 'string') {
@@ -148,18 +150,17 @@ class FacebookDownloader {
                 if (url) urls.add(url);
             }
         }
-
         return Array.from(urls);
     }
 
     async fetchJson() {
         let currentUrl = this.url;
 
-        // Handle fb.watch or /watch/?v URLs
         if (currentUrl.includes('fb.watch') || currentUrl.includes('/watch/?v')) {
             try {
                 const response = await this.get(currentUrl);
-                const urlPath = new URL(response.request.res.responseUrl).pathname;
+                const responseUrl = response.request.res.responseUrl || response.request.responseURL;
+                const urlPath = new URL(responseUrl).pathname;
                 const segments = urlPath.split('/');
                 const videoIndex = segments.indexOf('videos');
                 
@@ -186,7 +187,6 @@ class FacebookDownloader {
             let browserNativeHdUrl = null;
             let jsonData = null;
 
-            // Parse JSON scripts
             $('script[type="application/json"]').each((i, script) => {
                 const scriptText = $(script).text().trim();
                 
@@ -196,13 +196,10 @@ class FacebookDownloader {
                         preferredThumbnail = FacebookDownloader.getNestedValue(parsed, 'preferred_thumbnail');
                         browserNativeHdUrl = FacebookDownloader.getNestedValue(parsed, 'browser_native_hd_url');
                         jsonData = parsed;
-                    } catch (e) {
-                        // Skip invalid JSON
-                    }
+                    } catch (e) {}
                 }
             });
 
-            // Find main data script
             let result = null;
             $('script[type="application/json"]').each((i, script) => {
                 const scriptText = $(script).text().trim();
@@ -243,29 +240,20 @@ class FacebookDownloader {
                         parsed.preferred_thumbnail = preferredThumbnail || {};
 
                         result = parsed;
-                    } catch (e) {
-                        // Skip invalid JSON
-                    }
+                    } catch (e) {}
                 }
             });
 
-            if (result) {
-                return result;
-            }
+            if (result) return result;
 
             const fallbackMedia = FacebookDownloader.collectEmbeddedMediaUrls(html);
             if (fallbackMedia.length > 0) {
-                return {
-                    fallback_media: fallbackMedia,
-                    platform: 'facebook'
-                };
+                return { fallback_media: fallbackMedia, platform: 'facebook' };
             }
 
             throw new Error('Video not visible. Open it in Reels and share the link again.');
         } catch (error) {
-            if (error.message.includes('Video')) {
-                throw error;
-            }
+            if (error.message.includes('Video')) throw error;
             throw new Error(`Request error: ${error.message}`);
         }
     }
@@ -281,16 +269,12 @@ class FacebookDownloader {
 
             if (data.fallback_media && Array.isArray(data.fallback_media)) {
                 for (const url of data.fallback_media) {
-                    if (!out.includes(url)) {
-                        out.push(url);
-                    }
+                    if (!out.includes(url)) out.push(url);
                 }
             }
 
             for (const url of combinedMedia) {
-                if (!out.includes(url)) {
-                    out.push(url);
-                }
+                if (!out.includes(url)) out.push(url);
             }
 
             if (out.length === 0 && representations && Array.isArray(representations)) {
@@ -313,12 +297,8 @@ class FacebookDownloader {
                     }
                 }
 
-                if (bestVideo && bestVideo.base_url) {
-                    out.push(bestVideo.base_url);
-                }
-                if (bestAudio && bestAudio.base_url) {
-                    out.push(`audio===${bestAudio.base_url}`);
-                }
+                if (bestVideo && bestVideo.base_url) out.push(bestVideo.base_url);
+                if (bestAudio && bestAudio.base_url) out.push(`audio===${bestAudio.base_url}`);
             }
 
             if (preferredThumbnail && preferredThumbnail.image && preferredThumbnail.image.uri) {
@@ -326,57 +306,67 @@ class FacebookDownloader {
             }
 
             return {
-                success: true,
                 data: out,
                 total: out.length,
                 platform: 'facebook'
             };
         } catch (error) {
-            throw new Error(error.message || 'Failed to fetch data');
+            throw error;
         }
     }
 }
-// ==================== End Facebook Downloader Class ====================
 
-// Routes
+// ==================== Routes ====================
+
+// Home route
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// API endpoint to get Facebook Reel data
-app.post('/api/download', async (req, res) => {
+// API route - supports both GET and POST
+app.all('/api/', async (req, res) => {
     try {
-        const { url } = req.body;
+        let url;
         
+        // Get URL from POST body or GET query parameter
+        if (req.method === 'POST') {
+            url = req.body.url;
+        } else {
+            url = req.query.url;
+        }
+
         if (!url) {
             return res.status(400).json({
                 error: true,
-                message: 'URL is required'
+                message: 'URL is required',
+                error_message: 'URL is required'
             });
         }
 
-        // Validate URL
+        // Validate Facebook URL
         if (!url.includes('facebook.com') && !url.includes('fb.watch')) {
             return res.status(400).json({
                 error: true,
-                message: 'Please provide a valid Facebook URL'
+                message: 'Please provide a valid Facebook URL',
+                error_message: 'Unsupported URL'
             });
         }
 
-        const downloader = new FacebookDownloader(url);
-        const data = await downloader.getData();
+        const fb = new FacebookDownloader(client, url);
+        const result = await fb.getData();
         
-        return res.json(data);
+        return res.json(result);
     } catch (error) {
-        console.error('Download error:', error);
-        return res.status(500).json({
+        console.error('API Error:', error);
+        return res.status(502).json({
             error: true,
-            message: error.message || 'Failed to process the request'
+            message: error.message || 'Failed to fetch content',
+            error_message: error.message
         });
     }
 });
 
-// Health check endpoint
+// Health check
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
@@ -389,13 +379,14 @@ app.use((err, req, res, next) => {
     console.error(err.stack);
     res.status(500).json({
         error: true,
-        message: 'Internal server error'
+        message: 'Internal server error',
+        error_message: err.message
     });
 });
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+    console.log(`Media Saver API running on http://${HOST}:${PORT}`);
 });
 
 module.exports = app;
